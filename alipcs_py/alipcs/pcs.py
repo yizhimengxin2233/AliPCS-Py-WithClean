@@ -21,12 +21,15 @@ from alipcs_py.common.io import (
     total_len,
 )
 from alipcs_py.common.cache import timeout_cache
-from alipcs_py.alipcs.errors import AliPCSError, parse_error, to_refresh_token
+from alipcs_py.common.crypto import generate_secp256k1_keys
+from alipcs_py.alipcs.errors import AliPCSError, parse_error, handle_error
 from alipcs_py.alipcs.errors import assert_ok
 from alipcs_py.alipcs.inner import SharedAuth
 
 
 UPLOAD_CHUNK_SIZE = 10 * constant.OneM
+
+APP_ID = "5dde4e1bdf9e4966b387ba58f4b3fdc3"
 
 PCS_BAIDU_COM = "https://api.aliyundrive.com"
 # PCS_BAIDU_COM = 'http://127.0.0.1:8888'
@@ -51,7 +54,9 @@ class Method(Enum):
 class PcsNode(Enum):
     f"""PCS Nodes which use {PCS_BAIDU_COM}"""
 
+    Token = "v2/account/token"
     Refresh = "token/refresh"
+    CreateSession = "users/v1/users/device/create_session"
 
     FileList = "adrive/v3/file/list"
     Meta = "v2/file/get"
@@ -116,9 +121,11 @@ class AliPCS:
         self._nick_name = nick_name
         self._token_type = token_type
         self._device_id = device_id
+        self._signature = ""
         self._default_drive_id = default_drive_id
         self._role = role
         self._status = status
+        self._nonce = 0
 
     def __str__(self) -> str:
         return f"""AliPCS
@@ -131,10 +138,20 @@ class AliPCS:
     token_type: {self.token_type}
     expire_time: {self.expire_time}
     device_id: {self.device_id}
+    signature: {self.signature}
     default_drive_id: {self.default_drive_id}
     role: {self.role}
     status: {self.status}
+    nonce: {self._nonce}
     """
+
+    def get_token(self):
+        """Get authorization token"""
+
+        url = PcsNode.Token.url()
+        data = dict(refresh_token=self.refresh_token, grant_type="refresh_token")
+        resp = self._request(Method.Post, url, json=data)
+        return resp.json()
 
     @property
     def refresh_token(self) -> str:
@@ -142,6 +159,7 @@ class AliPCS:
             if (
                 not self._access_token
                 or (now_timestamp() - 1 * 60 * 60) >= self._expire_time
+                or not self._device_id
             ):
                 self.refresh()
             return self._refresh_token
@@ -180,6 +198,12 @@ class AliPCS:
     def device_id(self) -> str:
         self.refresh_token
         return self._device_id
+
+    @property
+    def signature(self) -> str:
+        if not self._signature:
+            self.create_session()
+        return self._signature
 
     @property
     def default_drive_id(self) -> str:
@@ -262,10 +286,45 @@ class AliPCS:
         self._role = info["role"]
         self._status = info["status"]
 
+        return info
+
+    def create_session(self):
+        """Create session"""
+
+        assert self.device_id, "No AliPCS._device_id"
+        assert self.user_id, "No AliPCS._user_id"
+
+        device_id = self.device_id
+        user_id = self.user_id
+        nonce = self._nonce
+
+        private_key, public_key = generate_secp256k1_keys()
+        message = f"{APP_ID}:{device_id}:{user_id}:{nonce}".encode()
+        signature: str = private_key.sign(message).hex()
+        sign = signature + "00"
+
+        url = PcsNode.CreateSession.url()
+        data = dict(
+            deviceName="Chrome浏览器",
+            modelName="Windows网页版",
+            pubKey=public_key.to_string().hex(),
+        )
+
+        headers = dict(**PCS_HEADERS)
+        headers.update({"x-device-id": device_id, "x-signature": sign})
+
+        resp = self._request(Method.Post, url, headers=headers, json=data)
+        info = resp.json()
+        if info["result"] and info["success"]:
+            self._signature = sign
+
+        return resp.json()
+
     def meta(self, *file_ids: str, share_id: str = None):
         assert "root" not in file_ids, '"root" has NOT meta info'
 
         headers = dict(PCS_HEADERS)
+        headers.update({"x-device-id": self.device_id, "x-signature": self.signature})
 
         if share_id:
             share_token = self.share_token(share_id)
@@ -333,7 +392,7 @@ class AliPCS:
             return False
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def list(
         self,
         file_id: str,
@@ -393,13 +452,10 @@ class AliPCS:
         return resp.json()
 
     @staticmethod
-    def part_info_list(size: int) -> List[Dict[str, int]]:
-        return [
-            dict(part_number=i)
-            for i in range(1, math.ceil(size / UPLOAD_CHUNK_SIZE) + 1)
-        ]
+    def part_info_list(part_number: int) -> List[Dict[str, int]]:
+        return [dict(part_number=i) for i in range(1, part_number + 1)]
 
-    @to_refresh_token
+    @handle_error
     def create_file(
         self,
         filename: str,
@@ -407,23 +463,37 @@ class AliPCS:
         size: int,
         pre_hash: str = "",
         content_hash: str = "",
+        part_number: int = 1,
         proof_code: str = "",
         check_name_mode: CheckNameMode = "auto_rename",
     ):
-        """
-        Args:
-            size (int):
-                the length of total content.
-            pre_hash (str):
-                The sha1 of the IO first 1k bytes
-            content_hash (str):
-                the sha1 of total content.
+        """Create a prepared file for uploading
+
+        filename (str):
+            The name of file.
+        dir_id (str):
+            The directory id where the file is at.
+        size (int):
+            the length of total content.
+        pre_hash (str):
+            The sha1 of the IO first 1k bytes
+        content_hash (str):
+            the sha1 of total content.
+        part_number (int):
+            The number of one file's chunks to upload.
+            The server will returns the number of urls to prepare to upload the file's chunks.
+            `WARNNING`: this value MUST be set by caller.
+        check_name_mode(str):
+            'overwrite' (直接覆盖，以后多版本有用)
+            'auto_rename' (自动换一个随机名称)
+            'refuse' (不会创建，告诉你已经存在)
+            'ignore' (会创建重名的)
         """
 
         url = PcsNode.CreateWithFolders.url()
         data = dict(
             drive_id=self.default_drive_id,
-            part_info_list=self.part_info_list(size),
+            part_info_list=self.part_info_list(part_number),
             parent_file_id=dir_id,
             name=filename,
             type="file",
@@ -439,11 +509,20 @@ class AliPCS:
         resp = self._request(Method.Post, url, json=data)
         return resp.json()
 
-    def prepare_file(self, filename: str, dir_id: str, size: int, pre_hash: str = ""):
-        return self.create_file(filename, dir_id, size, pre_hash=pre_hash)
+    def prepare_file(
+        self,
+        filename: str,
+        dir_id: str,
+        size: int,
+        pre_hash: str = "",
+        part_number: int = 1,
+    ):
+        return self.create_file(
+            filename, dir_id, size, pre_hash=pre_hash, part_number=part_number
+        )
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def rapid_upload_file(
         self, filename: str, dir_id: str, size: int, content_hash: str, proof_code: str
     ):
@@ -478,7 +557,7 @@ class AliPCS:
         )
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def upload_complete(self, file_id: str, upload_id: str):
         url = PcsNode.UploadComplete.url()
         data = dict(
@@ -490,7 +569,7 @@ class AliPCS:
         return resp.json()
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def search(
         self,
         keyword: str,
@@ -528,7 +607,7 @@ class AliPCS:
         return resp.json()
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def makedir(self, dir_id: str, name: str):
         url = PcsNode.CreateWithFolders.url()
         data = dict(
@@ -542,7 +621,7 @@ class AliPCS:
         return resp.json()
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def batch_operate(
         self,
         requests_: List[Dict[str, Any]],
@@ -587,7 +666,7 @@ class AliPCS:
         return self.batch_operate(requests_, resource="file")
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def rename(self, file_id: str, name: str):
         """Rename the file to `name`"""
 
@@ -640,7 +719,7 @@ class AliPCS:
         return self.batch_operate(requests_, resource="file")
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def check_available(self, file_ids: str):
         """Check whether file_ids are available"""
 
@@ -653,7 +732,7 @@ class AliPCS:
         return resp.json()
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def share(
         self, *file_ids: str, password: str = "", period: int = 0, description: str = ""
     ):
@@ -678,7 +757,7 @@ class AliPCS:
         return resp.json()
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def list_shared(self, next_marker: str = ""):
         """List shared links"""
 
@@ -710,7 +789,7 @@ class AliPCS:
         return self.batch_operate(requests_, resource="file")
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def get_share_token(self, share_id: str, share_password: str = ""):
         """Get share token"""
 
@@ -739,7 +818,7 @@ class AliPCS:
         return shared_auth.share_token
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def shared_info(self, share_id: str):
         """Get shared items info"""
 
@@ -789,7 +868,7 @@ class AliPCS:
         return self.batch_operate(requests_, resource="file", headers=headers)
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def _get_shared_file_download_url(
         self,
         shared_file_id: str,
@@ -831,7 +910,7 @@ class AliPCS:
         return resp.headers["Location"]
 
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def user_info(self):
         url = PcsNode.PersonalInfo.url()
         resp = self._request(Method.Post, url, json={})
@@ -849,11 +928,13 @@ class AliPCS:
 
     @timeout_cache(1 * 60 * 60)  # 1 hour timeout
     @assert_ok
-    @to_refresh_token
+    @handle_error
     def download_link(self, file_id: str):
         url = PcsNode.DownloadUrl.url()
         data = dict(drive_id=self.default_drive_id, file_id=file_id)
-        resp = self._request(Method.Post, url, json=data)
+        headers = dict(PCS_HEADERS)
+        headers.update({"x-device-id": self.device_id, "x-signature": self.signature})
+        resp = self._request(Method.Post, url, headers=headers, json=data)
         return resp.json()
 
     def file_stream(

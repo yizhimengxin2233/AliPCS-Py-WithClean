@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.5.3 - 2023-02-28
+
+### Updated
+
+- 因为 `device_id` 不再在 `AliPCS.user_info` 中返回，需要把运行环境中的 `device_id` 加入到 `user_info`。
+
+## v0.5.2 - 2023-02-25
+
+### Fixed
+
+- 修复 `DeviceSessionSignatureInvalid` 报错。支持自动更新 `signature`。
+
+## v0.5.1 - 2023-02-22
+
+### Fixed
+
+- 修复 `ls` 命令输出省略结果。 (#11)
+
+## v0.5.0 - 2023-02-15
+
+### Updated
+
+- 使用临时 API 接口，让下载可用。
+
+## v0.4.1 - 2023-02-02
+
+### Fixed
+
+- 修复安装失败。
+
+### Updated
+
+- 更新依赖。
+
+## v0.4.0 - 2023-01-09
+
+### Breaking Changes
+
+- 下面几个 api 都增加了参数 `part_number`。
+
+  - `AliPCS.create_file`
+  - `AliPCS.prepare_file`
+  - `AliPCSApi.create_file`
+  - `AliPCSApi.prepare_file`
+
+  `part_number` 指明上传的该文件需要分几次上传。
+  这个参数需要用户自己计算出来。一般用 `ceiling(上传文件大小 / 单个上传分片大小)`，其中一般 `单个上传分片大小` 建议为 `80MB`。
+
+### Fixed
+
+- 修复上传大于 100G 的文件失败的问题。 (#4)
+- 修复播出路径出错的问题。
+
 ## v0.3.4 - 2022-12-16
 
 ### Fixed

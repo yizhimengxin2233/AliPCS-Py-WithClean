@@ -1,5 +1,9 @@
 # AliPCS-Py
 
+**2023-02-15 使用临时 API 接口，让下载可用。**
+
+**2023-02-14 阿里网盘 API 下载接口不再提供第三方应用使用。需要申请使用官方 API 接口。目前官方 API 接口在内测中。本项目已提交内测申请，等待回复中。在此期间下载功能不能使用。**
+
 [![PyPI version](https://badge.fury.io/py/alipcs-py.svg)](https://badge.fury.io/py/alipcs-py)
 ![Build](https://github.com/PeterDing/AliPCS-Py/workflows/AliPCS-Py%20Build%20&%20Test/badge.svg)
 
@@ -435,6 +439,7 @@ AliPCS-Py ls -i file_id1 -i file_id2 -i ...
 | --no-highlight, --NH       | 取消匹配高亮                                          |
 | -S, --show-size            | 显示文件大小                                          |
 | -D, --show-date            | 显示文件创建时间                                      |
+| --show-file-id, --ID       | 显示文件 ID                                           |
 | -M, --show-hash            | 显示文件 sha1                                         |
 | -A, --show-absolute-path   | 显示文件绝对路径                                      |
 | --show-dl-link, --DL       | 显示文件下载连接                                      |
